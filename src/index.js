@@ -2,101 +2,113 @@ import express from 'express';
 import cors from 'cors';
 import { WebSocketServer } from 'ws';
 
-const PORT = process.env.PORT || 3000;
 const app = express();
-
-app.use(express.json());
 app.use(cors());
+app.use(express.json());
 
-const rooms = {};
+const PORT = process.env.PORT || 3000;
+const rooms = { general: [] }; // одразу створюємо general
+
+function ensureRoom(room) {
+  if (!rooms[room]) rooms[room] = [];
+}
+
+function broadcast(room, data) {
+  wss.clients.forEach((client) => {
+    if (client.room === room && client.readyState === 1) {
+      client.send(JSON.stringify(data));
+    }
+  });
+}
+
+app.get('/messages', (req, res) => {
+  const room = req.query.room || 'general';
+  res.send(rooms[room] || []);
+});
 
 app.post('/messages', (req, res) => {
   const { text, author, room = 'general' } = req.body;
 
-  if (!rooms[room]) rooms[room] = [];
+  ensureRoom(room);
 
-  const message = {
-    text,
-    author, // ✅ додано author
-    time: new Date(),
-    room,
-  };
-
+  const message = { text, author, time: new Date(), room };
   rooms[room].push(message);
 
-  for (const client of wss.clients) {
-    if (client.room === room && client.readyState === 1) {
-      client.send(JSON.stringify(message));
-    }
-  }
+  broadcast(room, { type: 'message', ...message });
 
-  res.status(201).send(rooms[room]);
-});
-
-app.get('/messages', (req, res) => {
-  const { room = 'general' } = req.query;
-  res.status(200).send(rooms[room] || []);
+  res.status(201).send(message);
 });
 
 app.get('/rooms', (req, res) => {
-  res.status(200).send(Object.keys(rooms));
+  res.send(Object.keys(rooms));
 });
 
 app.post('/rooms', (req, res) => {
   const { name } = req.body;
-  if (!rooms[name]) rooms[name] = [];
+  ensureRoom(name);
   res.status(201).send({ name });
-});
-
-app.patch('/rooms/:name', (req, res) => {
-  const { name } = req.params;
-  const { newName } = req.body;
-  if (!rooms[name]) return res.status(404).send({ error: 'Room not found' });
-  rooms[newName] = rooms[name];
-  delete rooms[name];
-  res.status(200).send({ name: newName });
 });
 
 app.delete('/rooms/:name', (req, res) => {
   const { name } = req.params;
+
+  if (!rooms[name]) {
+    return res.status(404).send({ error: 'Room not found' });
+  }
+
   delete rooms[name];
-  res.status(200).send({ deleted: name });
+
+  wss.clients.forEach((client) => {
+    if (client.room === name) {
+      client.room = 'general';
+      client.send(
+        JSON.stringify({
+          type: 'room_deleted',
+          redirectTo: 'general',
+        }),
+      );
+    }
+  });
+
+  res.send({ deleted: name });
 });
 
+
 const server = app.listen(PORT, () => {
-  console.log(`Server running at http://localhost:${PORT}/`);
+  console.log(`Server running on http://localhost:${PORT}`);
 });
 
 const wss = new WebSocketServer({ server });
 
-wss.on('connection', (connection) => {
-  connection.on('message', (data) => {
-    const { text, author, room = 'general' } = JSON.parse(data);
+wss.on('connection', (socket) => {
+  socket.room = 'general';
 
-    connection.room = room;
+  socket.on('message', (data) => {
+    const msg = JSON.parse(data);
 
-    if (!rooms[room]) rooms[room] = [];
+    if (msg.type === 'join') {
+      ensureRoom(msg.room);
+      socket.room = msg.room;
 
-    const message = {
-      text,
-      author, // ✅ додано author
-      time: new Date(),
-      room,
-    };
-
-    rooms[room].push(message);
-
-    for (const client of wss.clients) {
-      if (client.room === room && client.readyState === 1) {
-        client.send(JSON.stringify(message));
-      }
+      socket.send(
+        JSON.stringify({
+          type: 'history',
+          messages: rooms[msg.room],
+        }),
+      );
+      return;
     }
-  });
 
-  connection.on('room_join', (room) => {
-    connection.room = room;
-    if (rooms[room]) {
-      connection.send(JSON.stringify({ history: rooms[room] }));
+    if (msg.type === 'message') {
+      const message = {
+        text: msg.text,
+        author: msg.author,
+        time: new Date(),
+        room: socket.room,
+      };
+
+      rooms[socket.room].push(message);
+      broadcast(socket.room, { type: 'message', ...message });
     }
   });
 });
